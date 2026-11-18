@@ -3,6 +3,8 @@
 单进程浮标数据湖 API：按 UTC 日分区追加上传 CSV（浮标号、UTC 时刻、盐度），
 每次上传落为一个 Parquet 文件；支持按日读取全部记录与当前文件数；支持按日
 触发后台压实，把启动时已有的若干小文件合并为一份，降低下游扫描的小文件开销。
+另提供**按日快照**：把某一 UTC 日「创建时刻已登记的文件集合」固定下来，之后
+凭快照 ID 反复读取这批原始行（保留重复），不受后续补传、压实影响。
 
 技术栈：FastAPI + PyArrow + SQLite（WAL），单进程设计。
 
@@ -38,6 +40,11 @@ python -m pytest tests/ -q
 | POST | `/days/{day}/upload` | 上传 CSV（multipart 文件或 `text/csv` 原始 body），追加为一个 Parquet |
 | GET | `/days/{day}/records` | 读取当日全部记录（一致快照），含 `file_count`/`row_count` |
 | GET | `/days/{day}/files` | 当日活跃文件清单与文件数 |
+| POST | `/days/{day}/snapshots` | 为当日创建快照，返回快照 ID 与创建时的文件/行数 |
+| GET | `/days/{day}/snapshots` | 当日仍有效的快照列表 |
+| GET | `/snapshots/{snapshot_id}` | 快照内容：创建时的全部原始行（保留重复）及元数据 |
+| GET | `/snapshots/{snapshot_id}/records` | 同上（仅取记录体） |
+| DELETE | `/snapshots/{snapshot_id}` | 释放快照；该 ID 不再供数（幂等） |
 | POST | `/days/{day}/compactions` | 启动后台压实（202）；当日已有压实进行中返回 409 |
 | GET | `/days/{day}/compactions` | 当日压实任务列表 |
 | GET | `/days/{day}/compactions/{job_id}` | 查询压实任务状态 |
@@ -46,6 +53,27 @@ python -m pytest tests/ -q
 `day` 格式为 `YYYY-MM-DD`（UTC 日期分区）。CSV 列为 `buoy_id, ts_utc, salinity`，
 表头可选（无表头时按此顺序解析）；时间戳支持 ISO-8601（`Z` 或时区偏移，
 裸时间按 UTC 处理）。
+
+### 快照
+
+```bash
+# 创建：固定当日「此刻已登记」的文件集合，返回快照 ID
+curl -X POST http://localhost:8000/days/2026-11-18/snapshots
+# -> {"snapshot_id":"…","day":"2026-11-18","file_count":3,"row_count":120, …}
+
+# 读取：建立时可见的全部原始行（重复行逐条保留），与当前读数集合无关
+curl http://localhost:8000/snapshots/<snapshot_id>
+
+# 释放：此后该 ID 的读取返回 404；已开始的读取仍会完整返回
+curl -X DELETE http://localhost:8000/snapshots/<snapshot_id>
+```
+
+- 原始按日接口 `/days/{day}/records`、`/days/{day}/files` 仍返回**最新**数据。
+- 快照按「文件集合」而非「行号区间」固定：创建时取当日 `active` 文件的完整
+  清单，因此补传、压实都不会改变快照内容。
+- 若你的调用方按日命名空间组织，也可使用 `/days/{day}/snapshots/{snapshot_id}`
+  读取、`/days/{day}/snapshots/{snapshot_id}/records` 与对应 `DELETE`；快照 ID
+  本身全局唯一，跨日访问返回 404。
 
 ### 示例
 
@@ -61,6 +89,11 @@ curl http://localhost:8000/days/2026-11-18/records
 # 启动压实并轮询状态
 curl -X POST http://localhost:8000/days/2026-11-18/compactions
 curl http://localhost:8000/days/2026-11-18/compactions/1
+
+# 快照：创建 → 读取 → 释放
+curl -X POST http://localhost:8000/days/2026-11-18/snapshots
+curl http://localhost:8000/snapshots/<snapshot_id>
+curl -X DELETE http://localhost:8000/snapshots/<snapshot_id>
 ```
 
 ## 一致性与可靠性设计
@@ -85,15 +118,31 @@ curl http://localhost:8000/days/2026-11-18/compactions/1
 - **中断恢复**：启动时 `recover()` 先清理退役文件、孤儿 Parquet（未登记的
   上传残留、被取代的压实输出）和 tmp 碎片，再把仍处于 `running` 的任务重新
   投入执行（其输入必然仍全部 active，重跑是安全的）。已提交的上传不受影响。
+  仍被有效快照引用（pinned）的文件不会被这一步删除，因此重启不破坏旧快照。
 - **旧文件回收**：退役文件仅在在途读取引用计数归零后才 unlink；回收只针对
   登记表中 `retired` 的文件，`active` 文件（包括压实期间新追加的）永远不会
   被误删。另有后台周期清扫兜底。
+- **快照创建原子性**：快照行与其固定文件集合在**单个 SQLite 事务**中写入
+  （`BEGIN IMMEDIATE`），并与上传/压实切换的登记事务串行。因此一次创建必然
+  对应一组完整、已登记的文件；创建失败或进程中断只会留下未提交事务，不会
+  暴露半份快照，也不影响已成功的上传或压实。
+- **快照隔离**：创建后上传的新文件、以及压实产生的新文件都不属于旧快照；
+  快照读取按其固定清单逐文件读取，因此后续补传与压实都不改变旧快照内容。
+- **压实/重启不破坏旧快照**：回收器与启动清理都会跳过仍被有效快照引用的
+  文件；即使这些文件已被压实退役，字节也会保留到快照被释放。快照与固定
+  集合持久化在 SQLite 中，容器/进程重启后依旧可读。
+- **释放语义**：释放在一个事务内同时写入 `released_at` 墓碑并删除固定清单。
+  之后该 ID 的读取/查询返回 404，且不可恢复；已在进行的读取持有独立的
+  引用计数，仍会完整读完（不会读到一半丢文件）。引用计数归零后，只为该
+  快照保留的字节在下一次清扫时回收。
+- **空日快照**：当日尚无文件时也允许创建快照（空集合），之后的上传不会
+  进入该快照。
 
 ## 目录布局
 
 ```
 data/
-  lake_meta.db                 # SQLite 元数据（files 登记表 + compactions 任务表）
+  lake_meta.db                 # SQLite 元数据（files / compactions / snapshots / snapshot_files）
   dt=2026-11-18/
     part-<uuid>.parquet        # 上传产生的文件
     compacted-<job>-<id>.parquet  # 压实输出

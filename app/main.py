@@ -5,6 +5,11 @@ Endpoints
 POST   /days/{day}/upload                 append a CSV as one parquet file
 GET    /days/{day}/records                all records (consistent snapshot)
 GET    /days/{day}/files                  active file list / count
+POST   /days/{day}/snapshots              pin today's files under a snapshot id
+GET    /days/{day}/snapshots              live snapshots for the day
+GET    /snapshots/{snapshot_id}           snapshot metadata
+GET    /snapshots/{snapshot_id}/records   raw rows visible at creation time
+DELETE /snapshots/{snapshot_id}           release a snapshot
 POST   /days/{day}/compactions            start background compaction (202)
 GET    /days/{day}/compactions            list jobs for the day
 GET    /days/{day}/compactions/{job_id}   job status
@@ -92,6 +97,11 @@ def create_app(
                 "POST /days/{day}/upload",
                 "GET /days/{day}/records",
                 "GET /days/{day}/files",
+                "POST /days/{day}/snapshots",
+                "GET /days/{day}/snapshots",
+                "GET /snapshots/{snapshot_id}",
+                "GET /snapshots/{snapshot_id}/records",
+                "DELETE /snapshots/{snapshot_id}",
                 "POST /days/{day}/compactions",
                 "GET /days/{day}/compactions",
                 "GET /days/{day}/compactions/{job_id}",
@@ -119,6 +129,74 @@ def create_app(
     @app.get("/days/{day}/files")
     def files(day: str, request: Request):
         return lake(request).list_files(_valid_day(day))
+
+    # -- day snapshots -------------------------------------------------
+    # The canonical form is /days/{day}/snapshots for creation and
+    # /snapshots/{id}... for reading/releasing.  Day-scoped read/delete
+    # aliases are accepted too, since the id itself is globally unique.
+    @app.post("/days/{day}/snapshots")
+    def create_snapshot(day: str, request: Request):
+        """Pin the files currently registered for the day; returns the id."""
+        return lake(request).create_snapshot(_valid_day(day))
+
+    @app.get("/days/{day}/snapshots")
+    def list_snapshots(day: str, request: Request):
+        day = _valid_day(day)
+        return {"day": day, "snapshots": lake(request).list_snapshots(day)}
+
+    def _snapshot_for_day(lk: Lake, day: str, snapshot_id: str) -> dict:
+        body = lk.read_snapshot(snapshot_id)
+        if body["day"] != day:
+            raise HTTPException(
+                status_code=404, detail=f"snapshot {snapshot_id} does not belong to day {day}"
+            )
+        return body
+
+    @app.get("/snapshots/{snapshot_id}")
+    def get_snapshot(snapshot_id: str, request: Request):
+        """Snapshot content: metadata plus the raw rows visible at creation."""
+        try:
+            return lake(request).read_snapshot(snapshot_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.get("/snapshots/{snapshot_id}/records")
+    def snapshot_records(snapshot_id: str, request: Request):
+        """Every raw row visible when the snapshot was created (duplicates kept)."""
+        try:
+            return lake(request).read_snapshot(snapshot_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.get("/days/{day}/snapshots/{snapshot_id}")
+    def snapshot_content_for_day(day: str, snapshot_id: str, request: Request):
+        try:
+            return _snapshot_for_day(lake(request), _valid_day(day), snapshot_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.get("/days/{day}/snapshots/{snapshot_id}/records")
+    def snapshot_records_for_day(day: str, snapshot_id: str, request: Request):
+        try:
+            return _snapshot_for_day(lake(request), _valid_day(day), snapshot_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    def _release(lk: Lake, snapshot_id: str) -> dict:
+        try:
+            return lk.release_snapshot(snapshot_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.delete("/snapshots/{snapshot_id}")
+    def release_snapshot(snapshot_id: str, request: Request):
+        """Release a snapshot; its id stops serving data (idempotent)."""
+        return _release(lake(request), snapshot_id)
+
+    @app.delete("/days/{day}/snapshots/{snapshot_id}")
+    def release_snapshot_for_day(day: str, snapshot_id: str, request: Request):
+        _valid_day(day)
+        return _release(lake(request), snapshot_id)
 
     @app.post("/days/{day}/compactions", status_code=202)
     def start_compaction(day: str, request: Request):

@@ -65,6 +65,16 @@ def make_client(tmp_path, **kwargs) -> TestClient:
     return TestClient(create_app(data_dir=str(tmp_path / "data"), **kwargs))
 
 
+def snapshot_rows(body: dict) -> list[tuple]:
+    return sorted((r["buoy_id"], r["ts_utc"], r["salinity"]) for r in body["records"])
+
+
+def create_snapshot(client: TestClient, day: str = DAY) -> dict:
+    r = client.post(f"/days/{day}/snapshots")
+    assert r.status_code in (200, 201), r.text
+    return r.json()
+
+
 # ---------------------------------------------------------------------------
 # basic upload / read
 # ---------------------------------------------------------------------------
@@ -233,6 +243,265 @@ def test_compaction_on_empty_day_is_noop(tmp_path):
         assert job["status"] == "done"
         assert job["output_rows"] == 0
         assert c.get(f"/days/{DAY}/records").json()["row_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# day snapshots
+# ---------------------------------------------------------------------------
+
+def test_snapshot_is_isolated_from_later_appends_and_compaction(tmp_path):
+    with make_client(tmp_path) as c:
+        upload(c, CSV_A)
+        upload(c, CSV_B)
+        snap = create_snapshot(c)
+        sid = snap["id"]
+        assert snap["day"] == DAY
+        assert snap["file_count"] == 2 and snap["row_count"] == 4
+
+        # later appends and a compaction change the live day, not the snapshot
+        upload(c, CSV_C)
+        upload(c, CSV_DUP)
+        job_id = c.post(f"/days/{DAY}/compactions").json()["job_id"]
+        assert wait_job(c, DAY, job_id)["status"] == "done"
+
+        live = c.get(f"/days/{DAY}/records").json()
+        assert live["row_count"] == 7 and live["file_count"] == 1  # one compacted file
+
+        body = c.get(f"/snapshots/{sid}").json()
+        assert body["snapshot_id"] == sid and body["day"] == DAY
+        assert body["row_count"] == 4 and body["file_count"] == 2
+        assert snapshot_rows(body) == sorted([
+            ("B001", "2026-11-18T00:01:00Z", 35.1),
+            ("B002", "2026-11-18T00:02:00Z", 35.2),
+            ("B001", "2026-11-18T01:01:00Z", 35.3),
+            ("B003", "2026-11-18T01:02:00Z", 34.9),
+        ])
+
+        # same content through the explicit records route and the day alias
+        assert c.get(f"/snapshots/{sid}/records").json()["row_count"] == 4
+        assert c.get(f"/days/{DAY}/snapshots/{sid}/records").json()["row_count"] == 4
+        assert any(s["id"] == sid for s in c.get(f"/days/{DAY}/snapshots").json()["snapshots"])
+
+
+def test_snapshot_preserves_duplicate_rows(tmp_path):
+    with make_client(tmp_path) as c:
+        upload(c, CSV_DUP)
+        upload(c, CSV_DUP)
+        sid = create_snapshot(c)["id"]
+        # compaction keeps duplicates in the live view as well
+        job_id = c.post(f"/days/{DAY}/compactions").json()["job_id"]
+        assert wait_job(c, DAY, job_id)["status"] == "done"
+        snap = c.get(f"/snapshots/{sid}").json()
+        assert snap["row_count"] == 4
+        dup = ("B009", "2026-11-18T03:00:00Z", 33.3)
+        assert snapshot_rows(snap) == [dup] * 4
+        assert c.get(f"/days/{DAY}/records").json()["row_count"] == 4
+
+
+def test_snapshot_files_survive_compaction_reclamation(tmp_path):
+    """Compaction must not unlink bytes a live snapshot still serves."""
+    with make_client(tmp_path, gc_interval_sec=0.1) as c:
+        upload(c, CSV_A)
+        upload(c, CSV_B)
+        sid = create_snapshot(c)["id"]
+        data_dir = tmp_path / "data" / f"dt={DAY}"
+        part_files = {p for p in data_dir.glob("part-*.parquet")}
+        assert len(part_files) == 2
+
+        assert wait_job(c, DAY, c.post(f"/days/{DAY}/compactions").json()["job_id"])["status"] == "done"
+
+        # give the periodic sweeper several chances to (wrongly) reclaim them
+        time.sleep(0.5)
+        assert all(p.exists() for p in part_files)
+        assert c.get(f"/snapshots/{sid}").json()["row_count"] == 4
+
+        # releasing the snapshot makes the old bytes reclaimable
+        r = c.delete(f"/snapshots/{sid}")
+        assert r.status_code == 200, r.text
+        deadline = time.time() + 10
+        while time.time() < deadline and any(p.exists() for p in part_files):
+            time.sleep(0.05)
+        assert not any(p.exists() for p in part_files)
+        assert c.get(f"/days/{DAY}/records").json()["row_count"] == 4
+
+
+def test_released_snapshot_serves_nothing_but_inflight_read_finishes(tmp_path):
+    with make_client(tmp_path) as c:
+        upload(c, CSV_A)
+        upload(c, CSV_B)
+        sid = create_snapshot(c)["id"]
+
+        lake = c.app.state.lake
+        pinned = lake.read_snapshot(sid)  # a read that has already begun
+        assert pinned["row_count"] == 4
+
+        assert c.delete(f"/snapshots/{sid}").json()["released"] is True
+        assert c.get(f"/snapshots/{sid}").status_code == 404
+        assert c.get(f"/snapshots/{sid}/records").status_code == 404
+        assert c.get(f"/days/{DAY}/snapshots/{sid}").status_code == 404
+
+        # released id stays dead; deleting again is idempotent
+        assert c.delete(f"/snapshots/{sid}").json()["released"] is True
+        assert c.get(f"/days/{DAY}/snapshots").json()["snapshots"] == []
+
+        # the read that started before the release completed in full
+        assert pinned["records"] and len(pinned["records"]) == 4
+
+        # ... and a new snapshot is unaffected by the old tombstone
+        sid2 = create_snapshot(c)["id"]
+        assert sid2 != sid
+        assert c.get(f"/snapshots/{sid2}").json()["row_count"] == 4
+
+
+def test_snapshot_read_blocks_release_until_done(tmp_path):
+    """A release racing an in-flight read cannot truncate it."""
+    import unittest.mock as mock
+
+    import app.lake as lake_mod
+
+    with make_client(tmp_path, gc_interval_sec=0.1) as c:
+        upload(c, CSV_A)
+        upload(c, CSV_B)
+        sid = create_snapshot(c)["id"]
+        # compact: the snapshot's input files are now retired but pinned
+        assert wait_job(c, DAY, c.post(f"/days/{DAY}/compactions").json()["job_id"])["status"] == "done"
+        data_dir = tmp_path / "data" / f"dt={DAY}"
+        old_files = list(data_dir.glob("part-*.parquet"))
+        assert len(old_files) == 2
+
+        lake = c.app.state.lake
+        started = threading.Event()
+        proceed = threading.Event()
+        result = {}
+
+        real_read = lake_mod.pq.read_table
+
+        def slow_read(path, *a, **kw):
+            started.set()
+            assert proceed.wait(10)
+            return real_read(path, *a, **kw)
+
+        def reader():
+            result["body"] = lake.read_snapshot(sid)
+
+        with mock.patch.object(lake_mod.pq, "read_table", slow_read):
+            t = threading.Thread(target=reader)
+            t.start()
+            assert started.wait(10)
+
+            # release while the reader is mid-way: the id stops serving new
+            # reads, but the already-started read keeps its refcount
+            result["rel"] = lake.release_snapshot(sid)
+            assert result["rel"]["released"] is True
+            assert c.get(f"/snapshots/{sid}").status_code == 404
+
+            # neither the release's GC nor an explicit sweep may unlink bytes
+            # that an in-flight read still needs
+            lake.collect_garbage()
+            assert all(p.exists() for p in old_files)
+
+            proceed.set()
+            t.join(10)
+        assert result["body"]["row_count"] == 4
+        assert len(result["body"]["records"]) == 4
+
+        # once the read has finished, the space is reclaimable
+        lake.collect_garbage()
+        assert not any(p.exists() for p in old_files)
+        assert c.get(f"/days/{DAY}/records").json()["row_count"] == 4
+
+
+def test_snapshot_created_between_upload_and_compaction_is_complete(tmp_path):
+    """Creating snapshots while uploads/compactions run never yields a torn set."""
+    with make_client(tmp_path, compaction_delay_sec=0.4) as c:
+        for csv in (CSV_A, CSV_B, CSV_C):
+            upload(c, csv)
+        job_id = c.post(f"/days/{DAY}/compactions").json()["job_id"]
+
+        snap_ids = [create_snapshot(c)["id"] for _ in range(5)]
+        # every snapshot is either the pre-switch 3-file set or the
+        # post-switch 1-file set, never a mix, and always all 5 rows
+        for sid in snap_ids:
+            body = c.get(f"/snapshots/{sid}").json()
+            assert body["row_count"] == 5
+            assert body["file_count"] in (1, 3)
+            assert len(body["records"]) == 5
+
+        assert wait_job(c, DAY, job_id)["status"] == "done"
+        for sid in snap_ids:
+            assert c.get(f"/snapshots/{sid}").json()["row_count"] == 5
+
+
+def test_snapshot_survives_restart_and_is_not_swept(tmp_path):
+    data_dir = tmp_path / "data"
+    lake1 = Lake(str(data_dir))
+    lake1.upload(DAY, CSV_A.encode())
+    lake1.upload(DAY, CSV_B.encode())
+    sid = lake1.create_snapshot(DAY)["id"]
+    # retire the inputs as a compaction would; the snapshot predates the switch
+    with connect(str(lake1.db_path)) as conn:
+        rows = conn.execute(
+            "SELECT path FROM files WHERE day = ? AND state = 'active'", (DAY,)
+        ).fetchall()
+        conn.execute(
+            "INSERT INTO compactions(day, status, input_paths, input_rows, created_at)"
+            " VALUES (?, 'running', ?, ?, ?)",
+            (DAY, json.dumps([r["path"] for r in rows]), 4, "2026-11-18T00:00:00Z"),
+        )
+    del lake1
+
+    with make_client(tmp_path) as c:
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            jobs = c.get(f"/days/{DAY}/compactions").json()["jobs"]
+            if jobs and jobs[0]["status"] in ("done", "failed"):
+                break
+            time.sleep(0.05)
+        assert jobs[0]["status"] == "done", jobs[0]
+
+        # restart recovery removed retired files but kept the snapshot intact
+        snap = c.get(f"/snapshots/{sid}").json()
+        assert snap["row_count"] == 4 and snap["file_count"] == 2
+
+        # a second restart still serves it
+    with make_client(tmp_path) as c:
+        assert c.get(f"/snapshots/{sid}").json()["row_count"] == 4
+        assert c.get(f"/days/{DAY}/records").json()["row_count"] == 4
+
+
+def test_failed_snapshot_creation_leaves_nothing_behind(tmp_path, monkeypatch):
+    import app.lake as lake_mod
+
+    with make_client(tmp_path) as c:
+        upload(c, CSV_A)
+        before = c.get(f"/days/{DAY}/snapshots").json()["snapshots"]
+
+        def boom(*a, **kw):
+            raise IOError("disk full (simulated)")
+
+        monkeypatch.setattr(lake_mod, "connect", boom)
+        with pytest.raises(IOError):
+            c.post(f"/days/{DAY}/snapshots")
+        monkeypatch.undo()
+
+        # no half snapshot exposed, live day untouched
+        assert c.get(f"/days/{DAY}/snapshots").json()["snapshots"] == before
+        assert c.get(f"/days/{DAY}/records").json()["row_count"] == 2
+        with connect(str(tmp_path / "data" / "lake_meta.db")) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 0
+        # the service still works
+        assert c.get(f"/snapshots/{create_snapshot(c)['id']}").json()["row_count"] == 2
+
+
+def test_snapshot_unknown_or_other_day(tmp_path):
+    with make_client(tmp_path) as c:
+        assert c.get("/snapshots/nope").status_code == 404
+        assert c.delete("/snapshots/nope").status_code == 404
+        upload(c, CSV_A)
+        sid = create_snapshot(c)["id"]
+        assert c.get(f"/days/2026-11-17/snapshots/{sid}").status_code == 404
+        # the id is globally unique: the canonical route still works
+        assert c.get(f"/snapshots/{sid}").json()["row_count"] == 2
 
 
 # ---------------------------------------------------------------------------

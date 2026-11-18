@@ -16,6 +16,13 @@ Consistency model (single process, SQLite as the source of truth):
   job still ``running`` at startup is guaranteed not to have switched; it
   is simply re-executed.  Orphaned bytes (failed uploads, superseded
   compaction outputs, tmp fragments) are swept before serving traffic.
+* Snapshots: a snapshot pins the exact set of files that were registered
+  ``active`` for a day at creation time.  The snapshot row and its pinned
+  file set are inserted in one transaction, so creation is all-or-nothing.
+  Live snapshots protect their files from reclamation (including after a
+  compaction retires those files and across a restart); releasing a snapshot
+  unpins them, and the usual refcount keeps the bytes alive until any read
+  that already started has finished.
 """
 
 from __future__ import annotations
@@ -180,6 +187,160 @@ class Lake:
         }
 
     # ------------------------------------------------------------------
+    # day snapshots
+    # ------------------------------------------------------------------
+    def create_snapshot(self, day: str) -> dict:
+        """Pin the day's currently registered files under a fresh snapshot id.
+
+        The snapshot row and the pinned file set are written in one
+        ``BEGIN IMMEDIATE`` transaction, so uploads and compaction switches
+        either happen entirely before or entirely after the snapshot and a
+        failure leaves no half-snapshot behind.  ``_state_lock`` serialises
+        this against retired-file reclamation.
+        """
+        snapshot_id = uuid4().hex
+        created_at = _now_iso()
+        with self._state_lock:
+            conn = connect(str(self.db_path))
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                rows = conn.execute(
+                    "SELECT id, path, rows FROM files"
+                    " WHERE day = ? AND state = 'active' ORDER BY id",
+                    (day,),
+                ).fetchall()
+                total_rows = sum(r["rows"] for r in rows)
+                conn.execute(
+                    "INSERT INTO snapshots(id, day, file_count, row_count, created_at)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (snapshot_id, day, len(rows), total_rows, created_at),
+                )
+                conn.executemany(
+                    "INSERT INTO snapshot_files(snapshot_id, file_id, path, rows)"
+                    " VALUES (?, ?, ?, ?)",
+                    [(snapshot_id, r["id"], r["path"], r["rows"]) for r in rows],
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        log.info("snapshot %s created for %s over %d files", snapshot_id, day, len(rows))
+        return {
+            "snapshot_id": snapshot_id,
+            "id": snapshot_id,
+            "day": day,
+            "file_count": len(rows),
+            "row_count": total_rows,
+            "created_at": created_at,
+        }
+
+    def _snapshot_row(self, snapshot_id: str) -> sqlite3.Row:
+        with connect(str(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT * FROM snapshots WHERE id = ?", (snapshot_id,)
+            ).fetchone()
+        if row is None or row["released_at"] is not None:
+            raise NotFoundError(f"snapshot {snapshot_id} not found")
+        return row
+
+    def read_snapshot(self, snapshot_id: str) -> dict:
+        """All raw rows visible when the snapshot was created.
+
+        The snapshot's file set is pinned and refcounted under ``_state_lock``
+        in the same critical section that checks the snapshot is still live,
+        so a concurrent release either happens before the read starts (404) or
+        after the read has acquired its refcount (read completes in full).
+        """
+        with self._state_lock:
+            row = self._snapshot_row(snapshot_id)
+            with connect(str(self.db_path)) as conn:
+                file_rows = conn.execute(
+                    "SELECT path FROM snapshot_files WHERE snapshot_id = ? ORDER BY file_id",
+                    (snapshot_id,),
+                ).fetchall()
+            paths = [r["path"] for r in file_rows]
+            for p in paths:
+                self._inflight[p] = self._inflight.get(p, 0) + 1
+        try:
+            tables = [pq.read_table(p) for p in paths]
+            merged = pa.concat_tables(tables, promote_options="none") if tables else empty_table()
+            cols = merged.to_pydict()
+            records = [
+                {"buoy_id": b, "ts_utc": _iso_z(t), "salinity": s}
+                for b, t, s in zip(cols["buoy_id"], cols["ts_utc"], cols["salinity"])
+            ]
+            return {
+                "snapshot_id": row["id"],
+                "id": row["id"],
+                "day": row["day"],
+                "created_at": row["created_at"],
+                "file_count": len(paths),
+                "row_count": merged.num_rows,
+                "records": records,
+            }
+        finally:
+            self._release(paths)
+
+    def release_snapshot(self, snapshot_id: str) -> dict:
+        """Release a snapshot (idempotent); its id stops serving data.
+
+        Pins are removed atomically with the tombstone update.  Files that are
+        no longer needed by anything else become reclaimable immediately;
+        reads that already acquired a refcount finish on the old bytes.
+        """
+        with self._state_lock:
+            conn = connect(str(self.db_path))
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM snapshots WHERE id = ?", (snapshot_id,)
+                ).fetchone()
+                if row is None:
+                    conn.rollback()
+                    raise NotFoundError(f"snapshot {snapshot_id} not found")
+                if row["released_at"] is None:
+                    conn.execute(
+                        "UPDATE snapshots SET released_at = ? WHERE id = ?",
+                        (_now_iso(), snapshot_id),
+                    )
+                    # Drop the pins now; in-flight readers keep their own
+                    # refcounts and still finish on the original bytes.
+                    conn.execute(
+                        "DELETE FROM snapshot_files WHERE snapshot_id = ?", (snapshot_id,)
+                    )
+                conn.commit()
+            except NotFoundError:
+                raise
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        self.collect_garbage()
+        log.info("snapshot %s released", snapshot_id)
+        return {"snapshot_id": snapshot_id, "id": snapshot_id, "released": True}
+
+    def list_snapshots(self, day: str) -> list[dict]:
+        with connect(str(self.db_path)) as conn:
+            rows = conn.execute(
+                "SELECT * FROM snapshots WHERE day = ? AND released_at IS NULL ORDER BY created_at DESC",
+                (day,),
+            ).fetchall()
+        return [
+            {
+                "snapshot_id": r["id"],
+                "id": r["id"],
+                "day": r["day"],
+                "file_count": r["file_count"],
+                "row_count": r["row_count"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+
+    # ------------------------------------------------------------------
     # compaction
     # ------------------------------------------------------------------
     def start_compaction(self, day: str) -> dict:
@@ -319,17 +480,28 @@ class Lake:
         """Unlink retired files whose in-flight readers have all finished.
 
         Never touches ``active`` files, so freshly appended parquet files are
-        always safe.
+        always safe, and never touches files still pinned by a live snapshot
+        (which is what keeps an old snapshot readable after compaction).
         """
         collected = 0
         with self._state_lock:
             with connect(str(self.db_path)) as conn:
+                pinned = {
+                    r["path"]
+                    for r in conn.execute(
+                        "SELECT DISTINCT sf.path FROM snapshot_files sf"
+                        " JOIN snapshots s ON s.id = sf.snapshot_id"
+                        " WHERE s.released_at IS NULL"
+                    ).fetchall()
+                }
                 retired = conn.execute(
                     "SELECT id, path FROM files WHERE state = 'retired'"
                 ).fetchall()
                 for row in retired:
                     if self._inflight.get(row["path"], 0) > 0:
                         continue  # a reader is still using these bytes
+                    if row["path"] in pinned:
+                        continue  # a live snapshot still needs these bytes
                     try:
                         os.unlink(row["path"])
                     except FileNotFoundError:
@@ -351,14 +523,32 @@ class Lake:
         stats = {"retired_removed": 0, "orphans_removed": 0, "jobs_resumed": 0}
 
         with connect(str(self.db_path)) as conn:
+            # 0. Live snapshots pin their file set across restarts, so the
+            #    retired-file sweep below must leave those bytes alone.
+            pinned = {
+                r["path"]
+                for r in conn.execute(
+                    "SELECT DISTINCT sf.path FROM snapshot_files sf"
+                    " JOIN snapshots s ON s.id = sf.snapshot_id"
+                    " WHERE s.released_at IS NULL"
+                ).fetchall()
+            }
+            # Released snapshots are tombstones only; drop any leftover pins.
+            conn.execute(
+                "DELETE FROM snapshot_files WHERE snapshot_id IN"
+                " (SELECT id FROM snapshots WHERE released_at IS NOT NULL)"
+            )
             # 1. No reader can be in flight right after boot -> retired files
-            #    are safe to remove immediately.
+            #    not pinned by a live snapshot are safe to remove immediately.
             retired = conn.execute("SELECT id, path FROM files WHERE state = 'retired'").fetchall()
             for row in retired:
+                if row["path"] in pinned:
+                    continue  # an old snapshot still serves these bytes
                 Path(row["path"]).unlink(missing_ok=True)
                 conn.execute("DELETE FROM files WHERE id = ?", (row["id"],))
                 stats["retired_removed"] += 1
             known = {r["path"] for r in conn.execute("SELECT path FROM files").fetchall()}
+            known |= pinned
             running = conn.execute(
                 "SELECT id, day, input_paths FROM compactions WHERE status = 'running'"
             ).fetchall()
